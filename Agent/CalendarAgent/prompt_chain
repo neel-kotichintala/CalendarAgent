@@ -1,0 +1,121 @@
+from typing import Optional
+from datetime import datetime
+from pydantic import BaseModel, Field
+from openai import OpenAI
+import os
+import logging
+
+# Set up logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+model = "gpt-4o"
+
+class EventExtraction(BaseModel):
+    # First call: extracting basic event information
+
+    description: str = Field(description="Raw description of the event")
+    is_calendar_event: bool = Field(
+        description="Whether this text describes a calendar event"
+    )
+    confidence_score: float = Field(description="Confidence score between 0 and 1")
+
+class EventDetails(BaseModel):
+    # Once the first call confirms it is a valid event, this is the next call to extract event details.
+
+    name: str = Field(descripton="Name of the event")
+    date: str = Field(description="Date and time of the event. Use ISO 8601 format.")
+    duration_minutes: int = Field(description="Exepcted duration in minutes")
+    participants: list[str] = Field(description="List of participants")
+
+class EventConfirmation(BaseModel):
+    #Third Call: Generate confirmation message for the user to see.
+
+    confirmation_message: str = Field(
+        description="Natural language confirmation message for the user"
+    )
+    calendar_link: Optional[str] = Field(
+        description="Generated calendar link if applicable"
+    )
+
+def extract_event_info(user_input: str) -> EventExtraction:
+    today = datetime.now()
+    date_context = f"Today is {today.strftime('%A, %B %d, %Y')}."
+
+    completion = client.beta.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": f"{date_context} Analyzie if the text describes a calendar event.",
+            },
+            {"role": "user", "content": user_input},
+        ],
+        response_format=EventExtraction,
+    )
+
+def parse_event_details(description: str) -> EventDetails:
+
+    today = datetime.now()
+    date_context = f"Today is {today.strftime('%A, %B, %d, %Y')}."
+
+    completion = client.beta.chat.completions.parse(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": f"{date_context} Extract detailed event information. When dates reference 'next Tuesday' or similar relative dates, use this current date as reference.",
+            }
+            {"role": "user", "content": description},
+        ],
+        response_format=EventDetails
+    )
+    result = completion.choices[0].message.parsed
+    logger.info(
+        f"Parsed event details - Name: {result.name}, Date: {result.date}, Duration: {result.duration_minutes}min"
+    )
+    return result
+
+def generate_confirmation(event_details: EventDetails) -> EventConfirmation:
+    # Third call: generate a confirmation message
+
+    completion = client.beta.chat.completions.parse(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": "Generate a natural confirmation message for the event. Sign of with your name; Susie",
+            },
+            {"role": "user", "content": str(event_details.model_dump())},
+        ],
+        response_format=EventConfirmation,
+    )
+    result = completion.choices[0].message.parsed
+    return result
+
+def process_calendar_request(user_input: str) -> Optional[EventConfirmation]:
+    # Main function implementing the prompt chain with gate check.
+
+    initial_extraction = extract_event_info(user_input)
+
+    if (
+        not initial_extraction.is_calendar_event
+        or initial_extraction.confidence_score < 0.7
+    ):
+        logger.warning(
+            f"Gate check failed - is_calendar_event: {initial_extraction.is_calendar_event}, confidence: {initial_extraction.confidence_score:.2f}"
+        )
+        return None
+
+    logger.info("Gate check passed, proceeding with event processing")
+    event_details = parse_event_details(initial_extraction.description)
+
+    confirmation = generate_confirmation(event_details)
+
+    return confirmation
+
